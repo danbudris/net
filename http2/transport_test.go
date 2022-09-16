@@ -4732,3 +4732,146 @@ func TestClientConnTooIdle(t *testing.T) {
 		}
 	}
 }
+
+type fakeConnErr struct {
+	net.Conn
+	writeErr error
+	closed   bool
+}
+
+func (fce *fakeConnErr) Write(b []byte) (n int, err error) {
+	return 0, fce.writeErr
+}
+
+func (fce *fakeConnErr) Close() error {
+	fce.closed = true
+	return nil
+}
+
+// issue 39337: close the connection on a failed write
+func TestTransportNewClientConnCloseOnWriteError(t *testing.T) {
+	tr := &Transport{}
+	writeErr := errors.New("write error")
+	fakeConn := &fakeConnErr{writeErr: writeErr}
+	_, err := tr.NewClientConn(fakeConn)
+	if err != writeErr {
+		t.Fatalf("expected %v, got %v", writeErr, err)
+	}
+	if !fakeConn.closed {
+		t.Error("expected closed conn")
+	}
+}
+
+func TestTransportRoundtripCloseOnWriteError(t *testing.T) {
+	req, err := http.NewRequest("GET", "https://dummy.tld/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {}, optOnlyServer)
+	defer st.Close()
+
+	tr := &Transport{TLSClientConfig: tlsConfigInsecure}
+	defer tr.CloseIdleConnections()
+	cc, err := tr.dialClientConn(st.ts.Listener.Addr().String(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeErr := errors.New("write error")
+	cc.wmu.Lock()
+	cc.werr = writeErr
+	cc.wmu.Unlock()
+
+	_, err = cc.RoundTrip(req)
+	if err != writeErr {
+		t.Fatalf("expected %v, got %v", writeErr, err)
+	}
+
+	cc.mu.Lock()
+	closed := cc.closed
+	cc.mu.Unlock()
+	if !closed {
+		t.Fatal("expected closed")
+	}
+}
+
+// Issue 31192: A failed request may be retried if the body has not been read
+// already. If the request body has started to be sent, one must wait until it
+// is completed.
+func TestTransportBodyRewindRace(t *testing.T) {
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(http.StatusOK)
+		return
+	}, optOnlyServer)
+	defer st.Close()
+
+	tr := &http.Transport{
+		TLSClientConfig: tlsConfigInsecure,
+		MaxConnsPerHost: 1,
+	}
+	err := ConfigureTransport(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{
+		Transport: tr,
+	}
+
+	const clients = 50
+
+	var wg sync.WaitGroup
+	wg.Add(clients)
+	for i := 0; i < clients; i++ {
+		req, err := http.NewRequest("POST", st.ts.URL, bytes.NewBufferString("abcdef"))
+		if err != nil {
+			t.Fatalf("unexpect new request error: %v", err)
+		}
+
+		go func() {
+			defer wg.Done()
+			res, err := client.Do(req)
+			if err == nil {
+				res.Body.Close()
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// Issue 42498: A request with a body will never be sent if the stream is
+// reset prior to sending any data.
+func TestTransportServerResetStreamAtHeaders(t *testing.T) {
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}, optOnlyServer)
+	defer st.Close()
+
+	tr := &http.Transport{
+		TLSClientConfig:       tlsConfigInsecure,
+		MaxConnsPerHost:       1,
+		ExpectContinueTimeout: 10 * time.Second,
+	}
+
+	err := ConfigureTransport(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{
+		Transport: tr,
+	}
+
+	req, err := http.NewRequest("POST", st.ts.URL, errorReader{io.EOF})
+	if err != nil {
+		t.Fatalf("unexpect new request error: %v", err)
+	}
+	req.ContentLength = 0 // so transport is tempted to sniff it
+	req.Header.Set("Expect", "100-continue")
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+}

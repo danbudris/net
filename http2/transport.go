@@ -689,6 +689,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 	cc.inflow.add(transportDefaultConnFlow + initialWindowSize)
 	cc.bw.Flush()
 	if cc.werr != nil {
+		cc.Close()
 		return nil, cc.werr
 	}
 
@@ -1080,6 +1081,15 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 	bodyWriter := cc.t.getBodyWriterState(cs, body)
 	cs.on100 = bodyWriter.on100
 
+	defer func() {
+		cc.wmu.Lock()
+		werr := cc.werr
+		cc.wmu.Unlock()
+		if werr != nil {
+			cc.Close()
+		}
+	}()
+
 	cc.wmu.Lock()
 	endStream := !hasBody && !hasTrailers
 	werr := cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
@@ -1129,6 +1139,9 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 			// we can keep it.
 			bodyWriter.cancel()
 			cs.abortRequestBodyWrite(errStopReqBodyWrite)
+			if hasBody && !bodyWritten {
+				<-bodyWriter.resc
+			}
 		}
 		if re.err != nil {
 			cc.forgetStreamID(cs.ID)
@@ -1149,6 +1162,7 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 			} else {
 				bodyWriter.cancel()
 				cs.abortRequestBodyWrite(errStopReqBodyWriteAndCancel)
+				<-bodyWriter.resc
 			}
 			cc.forgetStreamID(cs.ID)
 			return nil, cs.getStartedWrite(), errTimeout
@@ -1158,6 +1172,7 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 			} else {
 				bodyWriter.cancel()
 				cs.abortRequestBodyWrite(errStopReqBodyWriteAndCancel)
+				<-bodyWriter.resc
 			}
 			cc.forgetStreamID(cs.ID)
 			return nil, cs.getStartedWrite(), ctx.Err()
@@ -1167,6 +1182,7 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 			} else {
 				bodyWriter.cancel()
 				cs.abortRequestBodyWrite(errStopReqBodyWriteAndCancel)
+				<-bodyWriter.resc
 			}
 			cc.forgetStreamID(cs.ID)
 			return nil, cs.getStartedWrite(), errRequestCanceled
@@ -1176,6 +1192,7 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 			// forgetStreamID.
 			return nil, cs.getStartedWrite(), cs.resetErr
 		case err := <-bodyWriter.resc:
+			bodyWritten = true
 			// Prefer the read loop's response, if available. Issue 16102.
 			select {
 			case re := <-readLoopResCh:
@@ -1186,7 +1203,6 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 				cc.forgetStreamID(cs.ID)
 				return nil, cs.getStartedWrite(), err
 			}
-			bodyWritten = true
 			if d := cc.responseHeaderTimeout(); d != 0 {
 				timer := time.NewTimer(d)
 				defer timer.Stop()
@@ -2525,6 +2541,7 @@ func strSliceContains(ss []string, s string) bool {
 
 type erringRoundTripper struct{ err error }
 
+func (rt erringRoundTripper) RoundTripErr() error                             { return rt.err }
 func (rt erringRoundTripper) RoundTrip(*http.Request) (*http.Response, error) { return nil, rt.err }
 
 // gzipReader wraps a response body so it can lazily
@@ -2606,7 +2623,9 @@ func (t *Transport) getBodyWriterState(cs *clientStream, body io.Reader) (s body
 
 func (s bodyWriterState) cancel() {
 	if s.timer != nil {
-		s.timer.Stop()
+		if s.timer.Stop() {
+			s.resc <- nil
+		}
 	}
 }
 
